@@ -42,6 +42,11 @@ class GraphRunContext:
     parameters: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     parent_graph_run_id: Optional[str] = None
+    # The step that just started inside this graph. The next call chains after it.
+    step_tip: Optional[str] = None
+    # How many times each function has been called in this run, so a retry can
+    # reuse the ones that already finished.
+    replay_counts: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def get(cls) -> Optional["GraphRunContext"]:

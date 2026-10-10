@@ -25,6 +25,7 @@ import inspect
 import traceback
 import functools
 import uuid
+import urllib.request
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, TypeVar, ParamSpec, Union
 from dataclasses import dataclass, field
@@ -576,6 +577,178 @@ def _arun_node(node_key: str, input_data: Any) -> NodeFuture:
 # @node decorator
 # ---------------------------------------------------------------------------
 
+def _post_inner_step(payload: dict) -> Optional[dict]:
+    """Tell the run page that a function inside a deployed graph started or finished.
+
+    Best-effort. A missing worker secret means this process is not the hosted
+    worker, so the function still runs and the chart simply has no extra box.
+    """
+    base = (
+        os.environ.get("GRAPHINGEST_API_URL")
+        or os.environ.get("INGEST_API_URL")
+        or ""
+    ).rstrip("/")
+    secret = os.environ.get("WORKER_CALLBACK_SECRET") or ""
+    flow_run_id = os.environ.get("FLOW_RUN_ID") or os.environ.get("GRAPH_RUN_ID") or ""
+    if not base or not secret or not flow_run_id:
+        return None
+    payload["flow_run_id"] = flow_run_id
+    request = urllib.request.Request(
+        f"{base}/api/webhook/steps",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {secret}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read().decode("utf-8")
+        parsed = json.loads(raw) if raw else {}
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as exc:
+        logger.warning("Could not report step %s: %s", payload.get("node_key"), exc)
+        return None
+
+
+def _saved_result(ctx: GraphRunContext, node_key: str) -> Any:
+    """Return a finished result from an earlier try, if this call already succeeded."""
+    index = ctx.replay_counts.get(node_key, 0)
+    ctx.replay_counts[node_key] = index + 1
+    saved = _post_inner_step({"event": "replay", "node_key": node_key, "call_index": index})
+    if not saved or not saved.get("replay"):
+        return _NO_SAVED
+    if isinstance(saved.get("step_id"), str):
+        ctx.step_tip = saved["step_id"]
+    return saved.get("result_data")
+
+
+def _jsonish(result: Any) -> Any:
+    try:
+        serialized = json.dumps(result, default=str)
+    except (TypeError, ValueError):
+        return None
+    if len(serialized) > 65536:
+        return None
+    try:
+        return json.loads(serialized)
+    except (TypeError, ValueError):
+        return None
+
+
+_NO_SAVED = object()
+
+
+def _run_inside_graph(node_key: str, call: Callable[[], R], max_retries: int) -> R:
+    """Run a @node that was called from inside a @graph, and report it as its own step.
+
+    A result that already finished on this run is returned again, so a later
+    retry of the job does not redo that function. This function retries itself
+    before the job is marked failed.
+    """
+    ctx = GraphRunContext.get_or_raise()
+    saved = _saved_result(ctx, node_key)
+    if saved is not _NO_SAVED:
+        return saved  # type: ignore[return-value]
+    step_id = str(uuid.uuid4())
+    parent = ctx.step_tip or os.environ.get("TASK_RUN_ID") or os.environ.get("NODE_RUN_ID") or None
+    body = {
+        "step_id": step_id,
+        "parent_task_run_id": parent,
+        "node_key": node_key,
+        "node_name": node_key,
+    }
+    _post_inner_step({**body, "event": "start"})
+    ctx.step_tip = step_id
+    started = time.monotonic()
+    attempts = 1 + max(0, max_retries)
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            result = call()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                delay = min(2 ** attempt, 30)
+                logger.warning(
+                    "Step %s attempt %s/%s failed: %s. Retrying in %ss.",
+                    node_key, attempt + 1, attempts, exc, delay,
+                )
+                if delay:
+                    time.sleep(delay)
+                continue
+            _post_inner_step({
+                **body,
+                "event": "fail",
+                "error_message": str(exc)[:2000],
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            })
+            ctx.step_tip = step_id
+            raise
+        _post_inner_step({
+            **body,
+            "event": "finish",
+            "result_data": _jsonish(result),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        })
+        ctx.step_tip = step_id
+        return result
+    raise last_exc  # type: ignore[misc]
+
+
+async def _run_inside_graph_async(node_key: str, call: Callable[[], Any], max_retries: int) -> R:
+    """Async form of `_run_inside_graph`."""
+    ctx = GraphRunContext.get_or_raise()
+    saved = _saved_result(ctx, node_key)
+    if saved is not _NO_SAVED:
+        return saved  # type: ignore[return-value]
+    step_id = str(uuid.uuid4())
+    parent = ctx.step_tip or os.environ.get("TASK_RUN_ID") or os.environ.get("NODE_RUN_ID") or None
+    body = {
+        "step_id": step_id,
+        "parent_task_run_id": parent,
+        "node_key": node_key,
+        "node_name": node_key,
+    }
+    _post_inner_step({**body, "event": "start"})
+    ctx.step_tip = step_id
+    started = time.monotonic()
+    attempts = 1 + max(0, max_retries)
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            result = await call()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                delay = min(2 ** attempt, 30)
+                logger.warning(
+                    "Step %s attempt %s/%s failed: %s. Retrying in %ss.",
+                    node_key, attempt + 1, attempts, exc, delay,
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+                continue
+            _post_inner_step({
+                **body,
+                "event": "fail",
+                "error_message": str(exc)[:2000],
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            })
+            ctx.step_tip = step_id
+            raise
+        _post_inner_step({
+            **body,
+            "event": "finish",
+            "result_data": _jsonish(result),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        })
+        ctx.step_tip = step_id
+        return result
+    raise last_exc  # type: ignore[misc]
+
+
 def node(
     name: Optional[str] = None,
     cache_ttl: Optional[int] = None,
@@ -617,6 +790,8 @@ def node(
         )
 
         def _execute_sync(*args: P.args, **kwargs: P.kwargs) -> R:
+            if GraphRunContext.current() is not None:
+                return _run_inside_graph(node_key, lambda: fn(*args, **kwargs), max_retries)
             node_run_id = os.environ.get("NODE_RUN_ID") or os.environ.get("TASK_RUN_ID", "")
             graph_run_id = os.environ.get("GRAPH_RUN_ID") or os.environ.get("FLOW_RUN_ID", "")
             client = get_client()
@@ -654,6 +829,8 @@ def node(
                 return result
 
         async def _execute_async(*args: P.args, **kwargs: P.kwargs) -> R:
+            if GraphRunContext.current() is not None:
+                return await _run_inside_graph_async(node_key, lambda: fn(*args, **kwargs), max_retries)
             node_run_id = os.environ.get("NODE_RUN_ID") or os.environ.get("TASK_RUN_ID", "")
             graph_run_id = os.environ.get("GRAPH_RUN_ID") or os.environ.get("FLOW_RUN_ID", "")
             client = get_client()
